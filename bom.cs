@@ -1,7 +1,7 @@
 #!/usr/bin/env dotnet
 #:property Version=0.1.0
 #:property Authors=Jan Jones
-#:property Description=Reset BOM changes from the current pull request.
+#:property Description=Manage BOM changes from the current pull request.
 #:property PackageOutputPath=./nupkg
 
 #:package System.CommandLine@2.0.0
@@ -24,34 +24,51 @@ static class BomTool
 
     static RootCommand CreateRootCommand()
     {
-        Argument<string> resetTargetArgument = new("target")
+        Argument<string> resetTargetArgument = CreateTargetArgument("reset");
+        Argument<string> checkTargetArgument = CreateTargetArgument("check");
+
+        Command checkCommand = new("check", "Report BOM changes and fail if any are found.")
         {
-            Description = "What to reset. Currently only 'pr' is supported.",
+            checkTargetArgument,
         };
+        checkCommand.SetAction((ParseResult parseResult, CancellationToken _) => RunTargetCommandAsync(
+            parseResult.GetValue(checkTargetArgument),
+            ResetMode.Check));
 
         Command resetCommand = new("reset", "Reset BOM changes.")
         {
             resetTargetArgument,
         };
-        resetCommand.SetAction((ParseResult parseResult, CancellationToken _) => ResetAsync(parseResult.GetValue(resetTargetArgument)));
+        resetCommand.SetAction((ParseResult parseResult, CancellationToken _) => RunTargetCommandAsync(
+            parseResult.GetValue(resetTargetArgument),
+            ResetMode.Reset));
 
         RootCommand rootCommand = new("Manage BOM changes.");
+        rootCommand.Subcommands.Add(checkCommand);
         rootCommand.Subcommands.Add(resetCommand);
 
         return rootCommand;
     }
 
-    static async Task<int> ResetAsync(string? target)
+    static Argument<string> CreateTargetArgument(string commandName)
+    {
+        return new Argument<string>("target")
+        {
+            Description = $"What to {commandName}. Currently only 'pr' is supported.",
+        };
+    }
+
+    static async Task<int> RunTargetCommandAsync(string? target, ResetMode mode)
     {
         if (target != "pr")
         {
-            Console.Error.WriteLine($"Unsupported reset target '{target}'. Supported values: pr.");
+            Console.Error.WriteLine($"Unsupported target '{target}'. Supported values: pr.");
             return 2;
         }
 
         try
         {
-            return await ResetCurrentPrAsync();
+            return await ResetCurrentPrAsync(mode);
         }
         catch (ToolFailureException ex)
         {
@@ -60,7 +77,7 @@ static class BomTool
         }
     }
 
-    static async Task<int> ResetCurrentPrAsync()
+    static async Task<int> ResetCurrentPrAsync(ResetMode mode)
     {
         string repositoryRoot = await GetRepositoryRootAsync();
         string currentPrefix = GetCurrentDirectoryPrefix(repositoryRoot);
@@ -73,6 +90,17 @@ static class BomTool
         {
             Console.WriteLine($"No PR changes found under {FormatScope(currentPrefix)} for PR #{pullRequest.Number}.");
             return 0;
+        }
+
+        if (mode == ResetMode.Check)
+        {
+            foreach (ResetOperation operation in operations)
+            {
+                Console.WriteLine($"{operation.Kind.ToCheckDisplayText()} {operation.Path}");
+            }
+
+            Console.Error.WriteLine($"Found {operations.Count} BOM change(s) under {FormatScope(currentPrefix)} from PR #{pullRequest.Number} ({pullRequest.Url}).");
+            return 1;
         }
 
         foreach (ResetOperation operation in operations)
@@ -377,6 +405,16 @@ static class BomTool
 
 static class ResetOperationKindExtensions
 {
+    public static string ToCheckDisplayText(this ResetOperationKind kind)
+    {
+        return kind switch
+        {
+            ResetOperationKind.Remove => "would remove",
+            ResetOperationKind.Restore => "would restore",
+            _ => $"would {kind.ToString().ToLowerInvariant()}",
+        };
+    }
+
     public static string ToDisplayText(this ResetOperationKind kind)
     {
         return kind switch
@@ -403,6 +441,12 @@ enum ResetOperationKind
 {
     Remove,
     Restore,
+}
+
+enum ResetMode
+{
+    Check,
+    Reset,
 }
 
 record CommandResult(int ExitCode, string StdOut, string StdErr);
