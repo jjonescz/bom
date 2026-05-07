@@ -88,20 +88,28 @@ static class BomTool
         string repositoryRoot = await GetRepositoryRootAsync();
         string currentPrefix = GetCurrentDirectoryPrefix(repositoryRoot);
         IReadOnlyList<WorktreeChange> changes = await GetCurrentWorktreeChangesAsync();
-        List<WorktreeChange> scopedChanges = [.. changes.Where(change => IsWorktreeChangeInCurrentScope(change, currentPrefix))];
+        List<WorktreeChange> bomChanges = [];
 
-        if (scopedChanges.Count == 0)
+        foreach (WorktreeChange change in changes)
         {
-            Console.WriteLine($"No working tree changes found under {FormatScope(currentPrefix)}.");
+            if (await IsBomOnlyWorktreeChangeAsync(change, repositoryRoot, currentPrefix))
+            {
+                bomChanges.Add(change);
+            }
+        }
+
+        if (bomChanges.Count == 0)
+        {
+            Console.WriteLine($"No BOM changes found in the working tree under {FormatScope(currentPrefix)}.");
             return 0;
         }
 
-        foreach (WorktreeChange change in scopedChanges)
+        foreach (WorktreeChange change in bomChanges)
         {
             Console.WriteLine(change.ToDisplayText());
         }
 
-        Console.Error.WriteLine($"Found {scopedChanges.Count} working tree change(s) under {FormatScope(currentPrefix)}.");
+        Console.Error.WriteLine($"Found {bomChanges.Count} working tree BOM change(s) under {FormatScope(currentPrefix)}.");
         return 1;
     }
 
@@ -112,11 +120,11 @@ static class BomTool
         PullRequestInfo pullRequest = await GetCurrentPullRequestAsync();
         string baseCommit = await EnsureBaseCommitAvailableAsync(pullRequest);
         IReadOnlyList<ChangeEntry> changes = await GetPullRequestChangesAsync(baseCommit);
-        List<ResetOperation> operations = BuildResetOperations(changes, currentPrefix);
+        List<ResetOperation> operations = await BuildBomResetOperationsAsync(changes, currentPrefix, baseCommit);
 
         if (operations.Count == 0)
         {
-            Console.WriteLine($"No PR changes found under {FormatScope(currentPrefix)} for PR #{pullRequest.Number}.");
+            Console.WriteLine($"No BOM changes found under {FormatScope(currentPrefix)} for PR #{pullRequest.Number}.");
             return 0;
         }
 
@@ -328,44 +336,27 @@ static class BomTool
         return entries;
     }
 
-    static List<ResetOperation> BuildResetOperations(IReadOnlyList<ChangeEntry> changes, string currentPrefix)
+    static async Task<List<ResetOperation>> BuildBomResetOperationsAsync(IReadOnlyList<ChangeEntry> changes, string currentPrefix, string baseCommit)
     {
         List<ResetOperation> operations = [];
         HashSet<ResetOperation> seenOperations = [];
 
         foreach (ChangeEntry change in changes)
         {
-            AddOperationsForChange(change, currentPrefix, operations, seenOperations);
+            if (change.Kind != 'M' || !IsInCurrentScope(change.Path, currentPrefix))
+            {
+                continue;
+            }
+
+            byte[] baseBytes = await GetGitFileBytesAsync(baseCommit, change.Path);
+            byte[] headBytes = await GetGitFileBytesAsync("HEAD", change.Path);
+            if (IsBomOnlyChange(baseBytes, headBytes))
+            {
+                AddIfInScope(new ResetOperation(ResetOperationKind.Restore, change.Path), currentPrefix, operations, seenOperations);
+            }
         }
 
         return operations;
-    }
-
-    static void AddOperationsForChange(ChangeEntry change, string currentPrefix, List<ResetOperation> operations, HashSet<ResetOperation> seenOperations)
-    {
-        switch (change.Kind)
-        {
-            case 'A':
-                AddIfInScope(new ResetOperation(ResetOperationKind.Remove, change.Path), currentPrefix, operations, seenOperations);
-                break;
-
-            case 'R':
-                if (change.OldPath is not null)
-                {
-                    AddIfInScope(new ResetOperation(ResetOperationKind.Restore, change.OldPath), currentPrefix, operations, seenOperations);
-                }
-
-                AddIfInScope(new ResetOperation(ResetOperationKind.Remove, change.Path), currentPrefix, operations, seenOperations);
-                break;
-
-            case 'C':
-                AddIfInScope(new ResetOperation(ResetOperationKind.Remove, change.Path), currentPrefix, operations, seenOperations);
-                break;
-
-            default:
-                AddIfInScope(new ResetOperation(ResetOperationKind.Restore, change.Path), currentPrefix, operations, seenOperations);
-                break;
-        }
     }
 
     static void AddIfInScope(ResetOperation operation, string currentPrefix, List<ResetOperation> operations, HashSet<ResetOperation> seenOperations)
@@ -388,10 +379,47 @@ static class BomTool
         return gitPath.StartsWith(currentPrefix, StringComparison.Ordinal);
     }
 
-    static bool IsWorktreeChangeInCurrentScope(WorktreeChange change, string currentPrefix)
+    static async Task<bool> IsBomOnlyWorktreeChangeAsync(WorktreeChange change, string repositoryRoot, string currentPrefix)
     {
-        return IsInCurrentScope(change.Path, currentPrefix)
-            || change.OldPath is not null && IsInCurrentScope(change.OldPath, currentPrefix);
+        if (!IsInCurrentScope(change.Path, currentPrefix)
+            || change.OldPath is not null
+            || change.Status == "??"
+            || !change.Status.Contains('M')
+            || change.Status.Contains('A')
+            || change.Status.Contains('D')
+            || change.Status.Contains('R')
+            || change.Status.Contains('C')
+            || change.Status.Contains('U'))
+        {
+            return false;
+        }
+
+        string fullPath = Path.Combine(repositoryRoot, change.Path.Replace('/', Path.DirectorySeparatorChar));
+        if (!File.Exists(fullPath))
+        {
+            return false;
+        }
+
+        byte[] headBytes = await GetGitFileBytesAsync("HEAD", change.Path);
+        byte[] worktreeBytes = await File.ReadAllBytesAsync(fullPath);
+        return IsBomOnlyChange(headBytes, worktreeBytes);
+    }
+
+    static bool IsBomOnlyChange(byte[] oldBytes, byte[] newBytes)
+    {
+        bool oldHasBom = HasUtf8Bom(oldBytes);
+        bool newHasBom = HasUtf8Bom(newBytes);
+        return oldHasBom != newHasBom && StripUtf8Bom(oldBytes).SequenceEqual(StripUtf8Bom(newBytes));
+    }
+
+    static bool HasUtf8Bom(byte[] bytes)
+    {
+        return bytes is [0xEF, 0xBB, 0xBF, ..];
+    }
+
+    static ReadOnlySpan<byte> StripUtf8Bom(byte[] bytes)
+    {
+        return HasUtf8Bom(bytes) ? bytes.AsSpan(3) : bytes;
     }
 
     static string FormatScope(string currentPrefix)
@@ -414,6 +442,11 @@ static class BomTool
         return path.Replace(Path.DirectorySeparatorChar, '/').Replace(Path.AltDirectorySeparatorChar, '/');
     }
 
+    static Task<byte[]> GetGitFileBytesAsync(string revision, string path)
+    {
+        return RunRequiredForBytesAsync("git", ["show", $"{revision}:{path}"]);
+    }
+
     static async Task<CommandResult> RunRequiredAsync(string fileName, IReadOnlyList<string> arguments)
     {
         CommandResult result = await RunAsync(fileName, arguments);
@@ -423,6 +456,23 @@ static class BomTool
         }
 
         string details = string.IsNullOrWhiteSpace(result.StdErr) ? result.StdOut.Trim() : result.StdErr.Trim();
+        if (string.IsNullOrWhiteSpace(details))
+        {
+            details = $"Command exited with code {result.ExitCode}.";
+        }
+
+        throw new ToolFailureException($"{FormatCommand(fileName, arguments)} failed: {details}", result.ExitCode == 0 ? 1 : result.ExitCode);
+    }
+
+    static async Task<byte[]> RunRequiredForBytesAsync(string fileName, IReadOnlyList<string> arguments)
+    {
+        CommandBytesResult result = await RunForBytesAsync(fileName, arguments);
+        if (result.ExitCode == 0)
+        {
+            return result.StdOut;
+        }
+
+        string details = result.StdErr.Trim();
         if (string.IsNullOrWhiteSpace(details))
         {
             details = $"Command exited with code {result.ExitCode}.";
@@ -454,6 +504,39 @@ static class BomTool
             await process.WaitForExitAsync();
 
             return new CommandResult(process.ExitCode, stdout, stderr);
+        }
+        catch (Win32Exception ex) when (ex.NativeErrorCode == 2)
+        {
+            throw new ToolFailureException($"Required command '{fileName}' was not found on PATH.", 127);
+        }
+    }
+
+    static async Task<CommandBytesResult> RunForBytesAsync(string fileName, IReadOnlyList<string> arguments)
+    {
+        ProcessStartInfo startInfo = new(fileName)
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+
+        foreach (string argument in arguments)
+        {
+            startInfo.ArgumentList.Add(argument);
+        }
+
+        try
+        {
+            using Process process = Process.Start(startInfo) ?? throw new InvalidOperationException($"Could not start '{fileName}'.");
+            using MemoryStream stdout = new();
+            Task stdoutTask = process.StandardOutput.BaseStream.CopyToAsync(stdout);
+            Task<string> stderrTask = process.StandardError.ReadToEndAsync();
+
+            await Task.WhenAll(stdoutTask, stderrTask);
+            await process.WaitForExitAsync();
+
+            return new CommandBytesResult(process.ExitCode, stdout.ToArray(), stderrTask.Result);
         }
         catch (Win32Exception ex) when (ex.NativeErrorCode == 2)
         {
@@ -545,3 +628,5 @@ enum ResetMode
 }
 
 record CommandResult(int ExitCode, string StdOut, string StdErr);
+
+record CommandBytesResult(int ExitCode, byte[] StdOut, string StdErr);
