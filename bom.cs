@@ -409,7 +409,8 @@ static class BomTool
     {
         bool oldHasBom = HasUtf8Bom(oldBytes);
         bool newHasBom = HasUtf8Bom(newBytes);
-        return oldHasBom != newHasBom && StripUtf8Bom(oldBytes).SequenceEqual(StripUtf8Bom(newBytes));
+        return oldHasBom != newHasBom
+            && NormalizeLineEndings(StripUtf8Bom(oldBytes)).SequenceEqual(NormalizeLineEndings(StripUtf8Bom(newBytes)));
     }
 
     static bool HasUtf8Bom(byte[] bytes)
@@ -420,6 +421,30 @@ static class BomTool
     static ReadOnlySpan<byte> StripUtf8Bom(byte[] bytes)
     {
         return HasUtf8Bom(bytes) ? bytes.AsSpan(3) : bytes;
+    }
+
+    static byte[] NormalizeLineEndings(ReadOnlySpan<byte> bytes)
+    {
+        List<byte> normalized = [];
+
+        for (int index = 0; index < bytes.Length; index++)
+        {
+            byte current = bytes[index];
+            if (current == '\r')
+            {
+                if (index + 1 < bytes.Length && bytes[index + 1] == '\n')
+                {
+                    index++;
+                }
+
+                normalized.Add((byte)'\n');
+                continue;
+            }
+
+            normalized.Add(current);
+        }
+
+        return [.. normalized];
     }
 
     static string FormatScope(string currentPrefix)
