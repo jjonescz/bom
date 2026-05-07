@@ -1,7 +1,7 @@
 #!/usr/bin/env dotnet
 #:property Version=0.1.0
 #:property Authors=Jan Jones
-#:property Description=Manage BOM changes from the current pull request.
+#:property Description=Manage BOM changes from the current pull request or working tree.
 #:property PackageOutputPath=./nupkg
 
 #:package System.CommandLine@2.0.0
@@ -24,8 +24,8 @@ static class BomTool
 
     static RootCommand CreateRootCommand()
     {
-        Argument<string> resetTargetArgument = CreateTargetArgument("reset");
-        Argument<string> checkTargetArgument = CreateTargetArgument("check");
+        Argument<string> resetTargetArgument = CreateTargetArgument("reset", "pr");
+        Argument<string> checkTargetArgument = CreateTargetArgument("check", "pr, worktree");
 
         Command checkCommand = new("check", "Report BOM changes and fail if any are found.")
         {
@@ -50,31 +50,59 @@ static class BomTool
         return rootCommand;
     }
 
-    static Argument<string> CreateTargetArgument(string commandName)
+    static Argument<string> CreateTargetArgument(string commandName, string supportedValues)
     {
         return new Argument<string>("target")
         {
-            Description = $"What to {commandName}. Currently only 'pr' is supported.",
+            Description = $"What to {commandName}. Supported values: {supportedValues}.",
         };
     }
 
     static async Task<int> RunTargetCommandAsync(string? target, ResetMode mode)
     {
-        if (target != "pr")
-        {
-            Console.Error.WriteLine($"Unsupported target '{target}'. Supported values: pr.");
-            return 2;
-        }
-
         try
         {
-            return await ResetCurrentPrAsync(mode);
+            return target switch
+            {
+                "pr" => await ResetCurrentPrAsync(mode),
+                "worktree" when mode == ResetMode.Check => await CheckCurrentWorktreeAsync(),
+                "worktree" => UnsupportedTarget(target, "pr"),
+                _ => UnsupportedTarget(target, mode == ResetMode.Check ? "pr, worktree" : "pr"),
+            };
         }
         catch (ToolFailureException ex)
         {
             Console.Error.WriteLine(ex.Message);
             return ex.ExitCode;
         }
+    }
+
+    static int UnsupportedTarget(string? target, string supportedValues)
+    {
+        Console.Error.WriteLine($"Unsupported target '{target}'. Supported values: {supportedValues}.");
+        return 2;
+    }
+
+    static async Task<int> CheckCurrentWorktreeAsync()
+    {
+        string repositoryRoot = await GetRepositoryRootAsync();
+        string currentPrefix = GetCurrentDirectoryPrefix(repositoryRoot);
+        IReadOnlyList<WorktreeChange> changes = await GetCurrentWorktreeChangesAsync();
+        List<WorktreeChange> scopedChanges = [.. changes.Where(change => IsWorktreeChangeInCurrentScope(change, currentPrefix))];
+
+        if (scopedChanges.Count == 0)
+        {
+            Console.WriteLine($"No working tree changes found under {FormatScope(currentPrefix)}.");
+            return 0;
+        }
+
+        foreach (WorktreeChange change in scopedChanges)
+        {
+            Console.WriteLine(change.ToDisplayText());
+        }
+
+        Console.Error.WriteLine($"Found {scopedChanges.Count} working tree change(s) under {FormatScope(currentPrefix)}.");
+        return 1;
     }
 
     static async Task<int> ResetCurrentPrAsync(ResetMode mode)
@@ -222,6 +250,46 @@ static class BomTool
         return ParseNameStatus(result.StdOut);
     }
 
+    static async Task<IReadOnlyList<WorktreeChange>> GetCurrentWorktreeChangesAsync()
+    {
+        CommandResult result = await RunRequiredAsync("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+        return ParsePorcelainStatus(result.StdOut);
+    }
+
+    static List<WorktreeChange> ParsePorcelainStatus(string output)
+    {
+        string[] tokens = output.Split('\0', StringSplitOptions.RemoveEmptyEntries);
+        List<WorktreeChange> changes = [];
+        int index = 0;
+
+        while (index < tokens.Length)
+        {
+            string token = tokens[index++];
+            if (token.Length < 4)
+            {
+                throw new ToolFailureException("Unexpected git status output while parsing a changed path.", 1);
+            }
+
+            string status = token[..2];
+            string path = token[3..];
+            string? oldPath = null;
+
+            if (status.Contains('R') || status.Contains('C'))
+            {
+                if (index >= tokens.Length)
+                {
+                    throw new ToolFailureException("Unexpected git status output while parsing a renamed or copied path.", 1);
+                }
+
+                oldPath = tokens[index++];
+            }
+
+            changes.Add(new WorktreeChange(status, oldPath, path));
+        }
+
+        return changes;
+    }
+
     static List<ChangeEntry> ParseNameStatus(string output)
     {
         string[] tokens = output.Split('\0', StringSplitOptions.RemoveEmptyEntries);
@@ -318,6 +386,12 @@ static class BomTool
         }
 
         return gitPath.StartsWith(currentPrefix, StringComparison.Ordinal);
+    }
+
+    static bool IsWorktreeChangeInCurrentScope(WorktreeChange change, string currentPrefix)
+    {
+        return IsInCurrentScope(change.Path, currentPrefix)
+            || change.OldPath is not null && IsInCurrentScope(change.OldPath, currentPrefix);
     }
 
     static string FormatScope(string currentPrefix)
@@ -436,6 +510,27 @@ record PullRequestInfo(int Number, string BaseRefName, string BaseRefOid, string
 record ChangeEntry(char Kind, string? OldPath, string Path);
 
 record ResetOperation(ResetOperationKind Kind, string Path);
+
+record WorktreeChange(string Status, string? OldPath, string Path)
+{
+    public string ToDisplayText()
+    {
+        string changeKind = Status switch
+        {
+            "??" => "untracked",
+            _ when Status.Contains('R') => "renamed",
+            _ when Status.Contains('C') => "copied",
+            _ when Status.Contains('U') => "unmerged",
+            _ when Status.Contains('A') => "added",
+            _ when Status.Contains('D') => "deleted",
+            _ when Status.Contains('M') => "modified",
+            _ when Status.Contains('T') => "typechanged",
+            _ => "changed",
+        };
+
+        return OldPath is null ? $"{changeKind} {Path}" : $"{changeKind} {OldPath} -> {Path}";
+    }
+}
 
 enum ResetOperationKind
 {
