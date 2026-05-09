@@ -4,6 +4,11 @@
 #:property Description=Manage BOM changes from the current pull request or working tree.
 #:property PackageReadmeFile=README.md
 #:property PackageOutputPath=./artifacts/nupkg
+#:property PackageLicenseExpression=MIT
+#:property RepositoryUrl=https://github.com/jjonescz/bom
+#:property PackageProjectUrl=$(RepositoryUrl)
+#:property RepositoryType=git
+#:property Copyright=© Jan Jones
 
 #:package System.CommandLine@2.0.0
 
