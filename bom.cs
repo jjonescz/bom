@@ -24,7 +24,7 @@ static class BomTool
 
     static RootCommand CreateRootCommand()
     {
-        Argument<string> resetTargetArgument = CreateTargetArgument("reset", "pr");
+        Argument<string> resetTargetArgument = CreateTargetArgument("reset", "pr, worktree");
         Argument<string> checkTargetArgument = CreateTargetArgument("check", "pr, worktree");
 
         Command checkCommand = new("check", "Report BOM changes and fail if any are found.")
@@ -66,8 +66,8 @@ static class BomTool
             {
                 "pr" => await ResetCurrentPrAsync(mode),
                 "worktree" when mode == ResetMode.Check => await CheckCurrentWorktreeAsync(),
-                "worktree" => UnsupportedTarget(target, "pr"),
-                _ => UnsupportedTarget(target, mode == ResetMode.Check ? "pr, worktree" : "pr"),
+                "worktree" => await ResetCurrentWorktreeAsync(),
+                _ => UnsupportedTarget(target, "pr, worktree"),
             };
         }
         catch (ToolFailureException ex)
@@ -87,16 +87,7 @@ static class BomTool
     {
         string repositoryRoot = await GetRepositoryRootAsync();
         string currentPrefix = GetCurrentDirectoryPrefix(repositoryRoot);
-        IReadOnlyList<WorktreeChange> changes = await GetCurrentWorktreeChangesAsync();
-        List<WorktreeChange> bomChanges = [];
-
-        foreach (WorktreeChange change in changes)
-        {
-            if (await IsBomOnlyWorktreeChangeAsync(change, repositoryRoot, currentPrefix))
-            {
-                bomChanges.Add(change);
-            }
-        }
+        List<WorktreeChange> bomChanges = await GetCurrentWorktreeBomChangesAsync(repositoryRoot, currentPrefix);
 
         if (bomChanges.Count == 0)
         {
@@ -111,6 +102,36 @@ static class BomTool
 
         Console.Error.WriteLine($"Found {bomChanges.Count} working tree BOM change(s) under {FormatScope(currentPrefix)}.");
         return 1;
+    }
+
+    static async Task<int> ResetCurrentWorktreeAsync()
+    {
+        string repositoryRoot = await GetRepositoryRootAsync();
+        string currentPrefix = GetCurrentDirectoryPrefix(repositoryRoot);
+        List<WorktreeChange> bomChanges = await GetCurrentWorktreeBomChangesAsync(repositoryRoot, currentPrefix);
+
+        if (bomChanges.Count == 0)
+        {
+            Console.WriteLine($"No BOM changes found in the working tree under {FormatScope(currentPrefix)}.");
+            return 0;
+        }
+
+        foreach (WorktreeChange change in bomChanges)
+        {
+            bool expectedHasBom = HasUtf8Bom(await GetGitFileBytesAsync("HEAD", change.Path));
+            bool shouldResetIndex = await IsIndexBomOnlyChangeAsync(change);
+            await SetWorktreeBomAsync(repositoryRoot, change.Path, expectedHasBom);
+
+            if (shouldResetIndex)
+            {
+                await RunRequiredAsync("git", ["restore", "--source", "HEAD", "--staged", "--", change.Path]);
+            }
+
+            Console.WriteLine($"reset {change.Path}");
+        }
+
+        Console.WriteLine($"Reset {bomChanges.Count} working tree BOM change(s) under {FormatScope(currentPrefix)}.");
+        return 0;
     }
 
     static async Task<int> ResetCurrentPrAsync(ResetMode mode)
@@ -141,14 +162,8 @@ static class BomTool
 
         foreach (ResetOperation operation in operations)
         {
-            _ = operation.Kind switch
-            {
-                ResetOperationKind.Remove => await RunRequiredAsync("git", ["rm", "--force", "--ignore-unmatch", "--", operation.Path]),
-                ResetOperationKind.Restore => await RunRequiredAsync("git", ["restore", "--source", baseCommit, "--staged", "--worktree", "--", operation.Path]),
-                _ => throw new InvalidOperationException($"Unknown reset operation '{operation.Kind}'."),
-            };
-
-            Console.WriteLine($"{operation.Kind.ToDisplayText()} {operation.Path}");
+            await SetWorktreeBomAsync(repositoryRoot, operation.Path, operation.ExpectedHasBom);
+            Console.WriteLine($"reset {operation.Path}");
         }
 
         Console.WriteLine($"Reset {operations.Count} path(s) under {FormatScope(currentPrefix)} from PR #{pullRequest.Number} ({pullRequest.Url}).");
@@ -264,6 +279,22 @@ static class BomTool
         return ParsePorcelainStatus(result.StdOut);
     }
 
+    static async Task<List<WorktreeChange>> GetCurrentWorktreeBomChangesAsync(string repositoryRoot, string currentPrefix)
+    {
+        IReadOnlyList<WorktreeChange> changes = await GetCurrentWorktreeChangesAsync();
+        List<WorktreeChange> bomChanges = [];
+
+        foreach (WorktreeChange change in changes)
+        {
+            if (await IsBomOnlyWorktreeChangeAsync(change, repositoryRoot, currentPrefix))
+            {
+                bomChanges.Add(change);
+            }
+        }
+
+        return bomChanges;
+    }
+
     static List<WorktreeChange> ParsePorcelainStatus(string output)
     {
         string[] tokens = output.Split('\0', StringSplitOptions.RemoveEmptyEntries);
@@ -350,9 +381,9 @@ static class BomTool
 
             byte[] baseBytes = await GetGitFileBytesAsync(baseCommit, change.Path);
             byte[] headBytes = await GetGitFileBytesAsync("HEAD", change.Path);
-            if (IsBomOnlyChange(baseBytes, headBytes))
+            if (HasBomChange(baseBytes, headBytes))
             {
-                AddIfInScope(new ResetOperation(ResetOperationKind.Restore, change.Path), currentPrefix, operations, seenOperations);
+                AddIfInScope(new ResetOperation(ResetOperationKind.Restore, change.Path, HasUtf8Bom(baseBytes)), currentPrefix, operations, seenOperations);
             }
         }
 
@@ -394,7 +425,7 @@ static class BomTool
             return false;
         }
 
-        string fullPath = Path.Combine(repositoryRoot, change.Path.Replace('/', Path.DirectorySeparatorChar));
+        string fullPath = GetWorktreePath(repositoryRoot, change.Path);
         if (!File.Exists(fullPath))
         {
             return false;
@@ -402,15 +433,64 @@ static class BomTool
 
         byte[] headBytes = await GetGitFileBytesAsync("HEAD", change.Path);
         byte[] worktreeBytes = await File.ReadAllBytesAsync(fullPath);
-        return IsBomOnlyChange(headBytes, worktreeBytes);
+        return HasBomChange(headBytes, worktreeBytes);
     }
 
-    static bool IsBomOnlyChange(byte[] oldBytes, byte[] newBytes)
+    static async Task<bool> IsIndexBomOnlyChangeAsync(WorktreeChange change)
     {
-        bool oldHasBom = HasUtf8Bom(oldBytes);
-        bool newHasBom = HasUtf8Bom(newBytes);
-        return oldHasBom != newHasBom
-            && NormalizeLineEndings(StripUtf8Bom(oldBytes)).SequenceEqual(NormalizeLineEndings(StripUtf8Bom(newBytes)));
+        char indexStatus = change.Status[0];
+        if (indexStatus is ' ' or '?' or 'A' or 'D' or 'R' or 'C' or 'U')
+        {
+            return false;
+        }
+
+        byte[] headBytes = await GetGitFileBytesAsync("HEAD", change.Path);
+        byte[] indexBytes = await GetGitFileBytesAsync(":", change.Path);
+        return HasBomChange(headBytes, indexBytes) && HasSameContentExceptBomAndLineEndings(headBytes, indexBytes);
+    }
+
+    static async Task SetWorktreeBomAsync(string repositoryRoot, string gitPath, bool expectedHasBom)
+    {
+        string fullPath = GetWorktreePath(repositoryRoot, gitPath);
+        if (!File.Exists(fullPath))
+        {
+            throw new ToolFailureException($"Cannot reset BOM for '{gitPath}' because the file does not exist in the working tree.", 1);
+        }
+
+        byte[] bytes = await File.ReadAllBytesAsync(fullPath);
+        bool actualHasBom = HasUtf8Bom(bytes);
+        if (actualHasBom == expectedHasBom)
+        {
+            return;
+        }
+
+        byte[] updatedBytes = expectedHasBom ? AddUtf8Bom(bytes) : StripUtf8Bom(bytes).ToArray();
+        await File.WriteAllBytesAsync(fullPath, updatedBytes);
+    }
+
+    static string GetWorktreePath(string repositoryRoot, string gitPath)
+    {
+        return Path.Combine(repositoryRoot, gitPath.Replace('/', Path.DirectorySeparatorChar));
+    }
+
+    static byte[] AddUtf8Bom(byte[] bytes)
+    {
+        byte[] updatedBytes = new byte[bytes.Length + 3];
+        updatedBytes[0] = 0xEF;
+        updatedBytes[1] = 0xBB;
+        updatedBytes[2] = 0xBF;
+        bytes.CopyTo(updatedBytes, 3);
+        return updatedBytes;
+    }
+
+    static bool HasBomChange(byte[] oldBytes, byte[] newBytes)
+    {
+        return HasUtf8Bom(oldBytes) != HasUtf8Bom(newBytes);
+    }
+
+    static bool HasSameContentExceptBomAndLineEndings(byte[] oldBytes, byte[] newBytes)
+    {
+        return NormalizeLineEndings(StripUtf8Bom(oldBytes)).SequenceEqual(NormalizeLineEndings(StripUtf8Bom(newBytes)));
     }
 
     static bool HasUtf8Bom(byte[] bytes)
@@ -469,7 +549,8 @@ static class BomTool
 
     static Task<byte[]> GetGitFileBytesAsync(string revision, string path)
     {
-        return RunRequiredForBytesAsync("git", ["show", $"{revision}:{path}"]);
+        string objectName = revision == ":" ? $":{path}" : $"{revision}:{path}";
+        return RunRequiredForBytesAsync("git", ["show", objectName]);
     }
 
     static async Task<CommandResult> RunRequiredAsync(string fileName, IReadOnlyList<string> arguments)
@@ -617,7 +698,7 @@ record PullRequestInfo(int Number, string BaseRefName, string BaseRefOid, string
 
 record ChangeEntry(char Kind, string? OldPath, string Path);
 
-record ResetOperation(ResetOperationKind Kind, string Path);
+record ResetOperation(ResetOperationKind Kind, string Path, bool ExpectedHasBom);
 
 record WorktreeChange(string Status, string? OldPath, string Path)
 {
