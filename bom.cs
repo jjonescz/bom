@@ -2,9 +2,13 @@
 #:property Version=0.1.0
 #:property Authors=Jan Jones
 #:property Description=Manage BOM changes from the current pull request or working tree.
-#:property PackageOutputPath=./nupkg
+#:property PackageReadmeFile=README.md
+#:property PackageOutputPath=./artifacts/nupkg
 
 #:package System.CommandLine@2.0.0
+
+#:package FileBasedApps@1.0.1
+#:property FileBasedAppsIncludeReadme=true
 
 using System.CommandLine;
 using System.ComponentModel;
