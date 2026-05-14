@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
+All notable user-visible changes to the `bom` command-line tool and NuGet package will be documented in this file.
 
 ## Unreleased
 
