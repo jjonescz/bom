@@ -147,14 +147,15 @@ static class BomTool
     {
         string repositoryRoot = await GetRepositoryRootAsync();
         string currentPrefix = GetCurrentDirectoryPrefix(repositoryRoot);
-        PullRequestInfo pullRequest = await GetCurrentPullRequestAsync();
-        string baseCommit = await EnsureBaseCommitAvailableAsync(pullRequest);
-        IReadOnlyList<ChangeEntry> changes = await GetPullRequestChangesAsync(baseCommit);
-        List<ResetOperation> operations = await BuildBomResetOperationsAsync(changes, currentPrefix, baseCommit);
+        ComparisonInfo comparison = await GetCurrentComparisonAsync();
+        string baseRevision = await EnsureBaseRevisionAvailableAsync(comparison);
+        string mergeBase = await GetMergeBaseAsync(baseRevision);
+        IReadOnlyList<ChangeEntry> changes = await GetPullRequestChangesAsync(mergeBase);
+        List<ResetOperation> operations = await BuildBomResetOperationsAsync(changes, currentPrefix, mergeBase);
 
         if (operations.Count == 0)
         {
-            Console.WriteLine($"No BOM changes found under {FormatScope(currentPrefix)} for PR #{pullRequest.Number}.");
+            Console.WriteLine($"No BOM changes found under {FormatScope(currentPrefix)} {comparison.ShortDescription}.");
             return 0;
         }
 
@@ -165,7 +166,7 @@ static class BomTool
                 Console.WriteLine($"{operation.Kind.ToCheckDisplayText()} {operation.Path}");
             }
 
-            Console.Error.WriteLine($"Found {operations.Count} BOM change(s) under {FormatScope(currentPrefix)} from PR #{pullRequest.Number} ({pullRequest.Url}).");
+            Console.Error.WriteLine($"Found {operations.Count} BOM change(s) under {FormatScope(currentPrefix)} {comparison.LongDescription}.");
             return 1;
         }
 
@@ -175,7 +176,7 @@ static class BomTool
             Console.WriteLine($"reset {operation.Path}");
         }
 
-        Console.WriteLine($"Reset {operations.Count} path(s) under {FormatScope(currentPrefix)} from PR #{pullRequest.Number} ({pullRequest.Url}).");
+        Console.WriteLine($"Reset {operations.Count} path(s) under {FormatScope(currentPrefix)} {comparison.LongDescription}.");
         return 0;
     }
 
@@ -205,9 +206,45 @@ static class BomTool
         return NormalizeGitPath(relativePath).TrimEnd('/') + "/";
     }
 
-    static async Task<PullRequestInfo> GetCurrentPullRequestAsync()
+    static async Task<ComparisonInfo> GetCurrentComparisonAsync()
     {
-        CommandResult result = await RunRequiredAsync("gh", ["pr", "view", "--json", "number,baseRefName,baseRefOid,url"]);
+        PullRequestInfo? pullRequest = await TryGetCurrentPullRequestAsync();
+        if (pullRequest is not null)
+        {
+            return new ComparisonInfo(
+                $"for PR #{pullRequest.Number}",
+                $"from PR #{pullRequest.Number} ({pullRequest.Url})",
+                pullRequest.BaseRefOid,
+                pullRequest.BaseRefName,
+                $"PR base commit '{pullRequest.BaseRefOid}'");
+        }
+
+        string baseBranch = await InferBaseBranchNameAsync();
+        string baseRevision = await GetBestBaseRevisionAsync(baseBranch);
+        return new ComparisonInfo(
+            $"against inferred base branch '{baseBranch}'",
+            $"against inferred base branch '{baseBranch}'",
+            baseRevision,
+            baseBranch,
+            $"inferred base branch '{baseBranch}'");
+    }
+
+    static async Task<PullRequestInfo?> TryGetCurrentPullRequestAsync()
+    {
+        CommandResult result;
+        try
+        {
+            result = await RunAsync("gh", ["pr", "view", "--json", "number,baseRefName,baseRefOid,url"]);
+        }
+        catch (ToolFailureException ex) when (ex.ExitCode == 127)
+        {
+            return null;
+        }
+
+        if (result.ExitCode != 0)
+        {
+            return null;
+        }
 
         try
         {
@@ -234,19 +271,19 @@ static class BomTool
         }
     }
 
-    static async Task<string> EnsureBaseCommitAvailableAsync(PullRequestInfo pullRequest)
+    static async Task<string> EnsureBaseRevisionAvailableAsync(ComparisonInfo comparison)
     {
-        if (await GitObjectExistsAsync(pullRequest.BaseRefOid))
+        if (await GitObjectExistsAsync(comparison.BaseRevision))
         {
-            return pullRequest.BaseRefOid;
+            return comparison.BaseRevision;
         }
 
         string remote = await GetPreferredRemoteAsync();
-        await RunRequiredAsync("git", ["fetch", "--quiet", remote, pullRequest.BaseRefName]);
+        await RunRequiredAsync("git", ["fetch", "--quiet", remote, comparison.FetchRefName]);
 
-        if (await GitObjectExistsAsync(pullRequest.BaseRefOid))
+        if (await GitObjectExistsAsync(comparison.BaseRevision))
         {
-            return pullRequest.BaseRefOid;
+            return comparison.BaseRevision;
         }
 
         if (await GitObjectExistsAsync("FETCH_HEAD"))
@@ -254,7 +291,174 @@ static class BomTool
             return "FETCH_HEAD";
         }
 
-        throw new ToolFailureException($"Could not find or fetch the PR base commit '{pullRequest.BaseRefOid}'.", 1);
+        throw new ToolFailureException($"Could not find or fetch the {comparison.BaseDescription}.", 1);
+    }
+
+    static async Task<string> GetMergeBaseAsync(string baseRevision)
+    {
+        CommandResult result = await RunRequiredAsync("git", ["merge-base", baseRevision, "HEAD"]);
+        string mergeBase = result.StdOut.Trim();
+        if (mergeBase.Length == 0)
+        {
+            throw new ToolFailureException($"Could not determine a merge base between '{baseRevision}' and HEAD.", 1);
+        }
+
+        return mergeBase;
+    }
+
+    static async Task<string> InferBaseBranchNameAsync()
+    {
+        string? preferredRemote = await TryGetPreferredRemoteAsync();
+        string? currentBranch = await TryGetCurrentBranchNameAsync();
+        if (currentBranch is not null)
+        {
+            string? configuredMergeBase = await TryGetConfiguredMergeBaseBranchAsync(currentBranch, preferredRemote);
+            if (configuredMergeBase is not null)
+            {
+                return configuredMergeBase;
+            }
+        }
+
+        if (preferredRemote is not null)
+        {
+            string? remoteDefaultBranch = await TryGetRemoteDefaultBranchNameAsync(preferredRemote);
+            if (remoteDefaultBranch is not null)
+            {
+                return remoteDefaultBranch;
+            }
+        }
+
+        foreach (string candidate in new[] { "main", "master" })
+        {
+            if (await HasLocalOrRemoteBranchAsync(candidate, preferredRemote))
+            {
+                return candidate;
+            }
+        }
+
+        if (preferredRemote is not null)
+        {
+            return "main";
+        }
+
+        throw new ToolFailureException("Could not infer a base branch. Configure one with 'git config branch.<branch>.gh-merge-base <base-branch>' or create a pull request.", 1);
+    }
+
+    static async Task<string?> TryGetCurrentBranchNameAsync()
+    {
+        CommandResult result = await RunAsync("git", ["branch", "--show-current"]);
+        if (result.ExitCode != 0)
+        {
+            return null;
+        }
+
+        string branchName = result.StdOut.Trim();
+        return branchName.Length == 0 ? null : branchName;
+    }
+
+    static async Task<string?> TryGetConfiguredMergeBaseBranchAsync(string currentBranch, string? preferredRemote)
+    {
+        CommandResult result = await RunAsync("git", ["config", "--get", $"branch.{currentBranch}.gh-merge-base"]);
+        if (result.ExitCode != 0)
+        {
+            return null;
+        }
+
+        string branchName = NormalizeBaseBranchName(result.StdOut.Trim(), preferredRemote);
+        return branchName.Length == 0 ? null : branchName;
+    }
+
+    static async Task<string?> TryGetRemoteDefaultBranchNameAsync(string remote)
+    {
+        CommandResult symbolicRefResult = await RunAsync("git", ["symbolic-ref", "--quiet", "--short", $"refs/remotes/{remote}/HEAD"]);
+        if (symbolicRefResult.ExitCode == 0)
+        {
+            string branchName = NormalizeBaseBranchName(symbolicRefResult.StdOut.Trim(), remote);
+            if (branchName.Length != 0)
+            {
+                return branchName;
+            }
+        }
+
+        CommandResult lsRemoteResult = await RunAsync("git", ["ls-remote", "--symref", remote, "HEAD"]);
+        if (lsRemoteResult.ExitCode != 0)
+        {
+            return null;
+        }
+
+        foreach (string line in lsRemoteResult.StdOut.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (!line.StartsWith("ref: refs/heads/", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            string[] tokens = line.Split(['\t', ' '], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            if (tokens.Length >= 2 && tokens[^1] == "HEAD")
+            {
+                return NormalizeBaseBranchName(tokens[1], remote);
+            }
+        }
+
+        return null;
+    }
+
+    static async Task<bool> HasLocalOrRemoteBranchAsync(string branchName, string? preferredRemote)
+    {
+        if (await GitObjectExistsAsync(branchName))
+        {
+            return true;
+        }
+
+        return preferredRemote is not null && await GitObjectExistsAsync($"{preferredRemote}/{branchName}");
+    }
+
+    static async Task<string> GetBestBaseRevisionAsync(string baseBranch)
+    {
+        string? preferredRemote = await TryGetPreferredRemoteAsync();
+        if (preferredRemote is not null)
+        {
+            string remoteRevision = $"{preferredRemote}/{baseBranch}";
+            if (await GitObjectExistsAsync(remoteRevision))
+            {
+                return remoteRevision;
+            }
+        }
+
+        if (await GitObjectExistsAsync(baseBranch))
+        {
+            return baseBranch;
+        }
+
+        return baseBranch;
+    }
+
+    static string NormalizeBaseBranchName(string branchName, string? preferredRemote)
+    {
+        branchName = branchName.Trim();
+
+        const string refsHeadsPrefix = "refs/heads/";
+        if (branchName.StartsWith(refsHeadsPrefix, StringComparison.Ordinal))
+        {
+            return branchName[refsHeadsPrefix.Length..];
+        }
+
+        if (preferredRemote is not null)
+        {
+            string refsRemotesPrefix = $"refs/remotes/{preferredRemote}/";
+            if (branchName.StartsWith(refsRemotesPrefix, StringComparison.Ordinal))
+            {
+                return branchName[refsRemotesPrefix.Length..];
+            }
+
+            string remotePrefix = $"{preferredRemote}/";
+            if (branchName.StartsWith(remotePrefix, StringComparison.Ordinal))
+            {
+                return branchName[remotePrefix.Length..];
+            }
+        }
+
+        return branchName;
     }
 
     static async Task<bool> GitObjectExistsAsync(string revision)
@@ -265,12 +469,28 @@ static class BomTool
 
     static async Task<string> GetPreferredRemoteAsync()
     {
-        CommandResult result = await RunRequiredAsync("git", ["remote"]);
+        string? preferredRemote = await TryGetPreferredRemoteAsync();
+        if (preferredRemote is null)
+        {
+            throw new ToolFailureException("The base commit is not available locally and this repository has no git remotes to fetch from.", 1);
+        }
+
+        return preferredRemote;
+    }
+
+    static async Task<string?> TryGetPreferredRemoteAsync()
+    {
+        CommandResult result = await RunAsync("git", ["remote"]);
+        if (result.ExitCode != 0)
+        {
+            return null;
+        }
+
         string[] remotes = result.StdOut.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
         if (remotes.Length == 0)
         {
-            throw new ToolFailureException("The PR base commit is not available locally and this repository has no git remotes to fetch from.", 1);
+            return null;
         }
 
         return remotes.Contains("origin", StringComparer.Ordinal) ? "origin" : remotes[0];
@@ -704,6 +924,8 @@ sealed class ToolFailureException(string message, int exitCode) : Exception(mess
 }
 
 record PullRequestInfo(int Number, string BaseRefName, string BaseRefOid, string Url);
+
+record ComparisonInfo(string ShortDescription, string LongDescription, string BaseRevision, string FetchRefName, string BaseDescription);
 
 record ChangeEntry(char Kind, string? OldPath, string Path);
 

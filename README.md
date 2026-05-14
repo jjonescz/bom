@@ -16,19 +16,19 @@ Reset BOM changes in the current Git working tree:
 dnx bom reset worktree
 ```
 
-Check for BOM changes introduced by the current GitHub pull request:
+Check for BOM changes introduced by the current GitHub pull request or branch:
 
 ```powershell
 dnx bom check pr
 ```
 
-Reset BOM changes introduced by the current GitHub pull request:
+Reset BOM changes introduced by the current GitHub pull request or branch:
 
 ```powershell
 dnx bom reset pr
 ```
 
-The `pr` target uses the GitHub CLI to detect the current pull request. The `worktree` target uses Git status in the current repository.
+The `pr` target uses the GitHub CLI to detect the current pull request. If no pull request exists yet, it falls back to comparing the current branch against an inferred base branch. The base branch is inferred from `branch.<branch>.gh-merge-base`, the remote default branch, or common default branch names. The `worktree` target uses Git status in the current repository.
 
 ## Behavior
 
