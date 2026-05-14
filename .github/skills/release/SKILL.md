@@ -19,7 +19,7 @@ Use this skill to publish a new `bom` package release.
 2. Determine the release version:
    - If the user provided a version, normalize it.
    - If the user did not provide a version, infer the next patch version from `#:property Version=` in [bom.cs](../../../bom.cs).
-   - Tell the user the inferred version and continue with it. Only ask for a different version if the user requested a non-patch release, the inferred version is ambiguous, or the inferred tag already exists.
+   - Tell the user the inferred version and ask if they are okay with it, or want to bump a different part of it instead.
    - `packageVersion`: version without a leading `v`, for example `0.1.1`.
    - `tagName`: version with a leading `v`, for example `v0.1.1`.
    ```powershell
