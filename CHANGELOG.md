@@ -4,6 +4,8 @@ All notable user-visible changes to the `bom` command-line tool and NuGet packag
 
 ## Unreleased
 
+## v0.1.1 - 2026-05-14
+
 - Support checking and resetting branch changes before a pull request is created.
 
 ## v0.1.0 - 2026-05-14
