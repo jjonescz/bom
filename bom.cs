@@ -1,5 +1,5 @@
 #!/usr/bin/env dotnet
-#:property Version=0.1.1
+#:property Version=0.1.2
 #:property Authors=Jan Jones
 #:property Description=Manage BOM changes from the current pull request or working tree.
 #:property PackageReadmeFile=README.md

@@ -4,6 +4,8 @@ All notable user-visible changes to the `bom` command-line tool and NuGet packag
 
 ## Unreleased
 
+## v0.1.2 - 2026-06-11
+
 - Fix `bom check pr` and `bom reset pr` in GitHub Actions pull request checkouts with shallow PR merge refs.
 
 ## v0.1.1 - 2026-05-14
