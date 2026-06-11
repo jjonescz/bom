@@ -149,7 +149,7 @@ static class BomTool
         string currentPrefix = GetCurrentDirectoryPrefix(repositoryRoot);
         ComparisonInfo comparison = await GetCurrentComparisonAsync();
         string baseRevision = await EnsureBaseRevisionAvailableAsync(comparison);
-        string mergeBase = await GetMergeBaseAsync(baseRevision);
+        string mergeBase = await GetMergeBaseAsync(baseRevision, comparison);
         IReadOnlyList<ChangeEntry> changes = await GetPullRequestChangesAsync(mergeBase);
         List<ResetOperation> operations = await BuildBomResetOperationsAsync(changes, currentPrefix, mergeBase);
 
@@ -279,11 +279,17 @@ static class BomTool
         }
 
         string remote = await GetPreferredRemoteAsync();
-        await RunRequiredAsync("git", ["fetch", "--quiet", remote, comparison.FetchRefName]);
+        await FetchBaseRefAsync(remote, comparison.FetchRefName, deepen: false);
 
         if (await GitObjectExistsAsync(comparison.BaseRevision))
         {
             return comparison.BaseRevision;
+        }
+
+        string remoteRevision = GetRemoteRevision(remote, comparison.FetchRefName);
+        if (await GitObjectExistsAsync(remoteRevision))
+        {
+            return remoteRevision;
         }
 
         if (await GitObjectExistsAsync("FETCH_HEAD"))
@@ -294,9 +300,22 @@ static class BomTool
         throw new ToolFailureException($"Could not find or fetch the {comparison.BaseDescription}.", 1);
     }
 
-    static async Task<string> GetMergeBaseAsync(string baseRevision)
+    static async Task<string> GetMergeBaseAsync(string baseRevision, ComparisonInfo comparison)
     {
-        CommandResult result = await RunRequiredAsync("git", ["merge-base", baseRevision, "HEAD"]);
+        CommandResult result = await RunAsync("git", ["merge-base", baseRevision, "HEAD"]);
+        if (result.ExitCode != 0 && await IsShallowRepositoryAsync())
+        {
+            string remote = await GetPreferredRemoteAsync();
+            await FetchBaseRefAsync(remote, comparison.FetchRefName, deepen: true);
+            await TryFetchCurrentGitHubRefAsync(remote);
+            result = await RunAsync("git", ["merge-base", baseRevision, "HEAD"]);
+        }
+
+        if (result.ExitCode != 0)
+        {
+            throw result.CreateFailureException();
+        }
+
         string mergeBase = result.StdOut.Trim();
         if (mergeBase.Length == 0)
         {
@@ -304,6 +323,46 @@ static class BomTool
         }
 
         return mergeBase;
+    }
+
+    static Task FetchBaseRefAsync(string remote, string branchName, bool deepen)
+    {
+        List<string> arguments = ["fetch", "--quiet"];
+        if (deepen)
+        {
+            arguments.Add("--deepen=100");
+        }
+
+        arguments.Add(remote);
+        arguments.Add(GetRemoteBranchRefSpec(remote, branchName));
+        return RunRequiredAsync("git", arguments);
+    }
+
+    static async Task TryFetchCurrentGitHubRefAsync(string remote)
+    {
+        string? githubRef = Environment.GetEnvironmentVariable("GITHUB_REF");
+        if (string.IsNullOrWhiteSpace(githubRef) || !githubRef.StartsWith("refs/", StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        await RunAsync("git", ["fetch", "--quiet", "--deepen=100", remote, githubRef]);
+    }
+
+    static async Task<bool> IsShallowRepositoryAsync()
+    {
+        CommandResult result = await RunAsync("git", ["rev-parse", "--is-shallow-repository"]);
+        return result.ExitCode == 0 && result.StdOut.Trim().Equals("true", StringComparison.OrdinalIgnoreCase);
+    }
+
+    static string GetRemoteRevision(string remote, string branchName)
+    {
+        return $"{remote}/{branchName}";
+    }
+
+    static string GetRemoteBranchRefSpec(string remote, string branchName)
+    {
+        return $"+refs/heads/{branchName}:refs/remotes/{remote}/{branchName}";
     }
 
     static async Task<string> InferBaseBranchNameAsync()
@@ -790,13 +849,7 @@ static class BomTool
             return result;
         }
 
-        string details = string.IsNullOrWhiteSpace(result.StdErr) ? result.StdOut.Trim() : result.StdErr.Trim();
-        if (string.IsNullOrWhiteSpace(details))
-        {
-            details = $"Command exited with code {result.ExitCode}.";
-        }
-
-        throw new ToolFailureException($"{FormatCommand(fileName, arguments)} failed: {details}", result.ExitCode == 0 ? 1 : result.ExitCode);
+        throw result.CreateFailureException();
     }
 
     static async Task<byte[]> RunRequiredForBytesAsync(string fileName, IReadOnlyList<string> arguments)
@@ -813,7 +866,7 @@ static class BomTool
             details = $"Command exited with code {result.ExitCode}.";
         }
 
-        throw new ToolFailureException($"{FormatCommand(fileName, arguments)} failed: {details}", result.ExitCode == 0 ? 1 : result.ExitCode);
+        throw new ToolFailureException($"{CommandFormatting.FormatCommand(fileName, arguments)} failed: {details}", result.ExitCode == 0 ? 1 : result.ExitCode);
     }
 
     static async Task<CommandResult> RunAsync(string fileName, IReadOnlyList<string> arguments)
@@ -838,7 +891,7 @@ static class BomTool
             string stderr = await process.StandardError.ReadToEndAsync();
             await process.WaitForExitAsync();
 
-            return new CommandResult(process.ExitCode, stdout, stderr);
+            return new CommandResult(startInfo, process.ExitCode, stdout, stderr);
         }
         catch (Win32Exception ex) when (ex.NativeErrorCode == 2)
         {
@@ -879,7 +932,16 @@ static class BomTool
         }
     }
 
-    static string FormatCommand(string fileName, IReadOnlyList<string> arguments)
+}
+
+static class CommandFormatting
+{
+    public static string FormatCommand(ProcessStartInfo startInfo)
+    {
+        return FormatCommand(startInfo.FileName, startInfo.ArgumentList);
+    }
+
+    public static string FormatCommand(string fileName, IReadOnlyList<string> arguments)
     {
         return string.Join(" ", [fileName, .. arguments.Select(QuoteArgument)]);
     }
@@ -964,6 +1026,18 @@ enum ResetMode
     Reset,
 }
 
-record CommandResult(int ExitCode, string StdOut, string StdErr);
+record CommandResult(ProcessStartInfo StartInfo, int ExitCode, string StdOut, string StdErr)
+{
+    public ToolFailureException CreateFailureException()
+    {
+        string details = (StdOut.Trim() + "\n" + StdErr.Trim()).Trim();
+        if (string.IsNullOrWhiteSpace(details))
+        {
+            details = $"Command exited with code {ExitCode}.";
+        }
+
+        return new ToolFailureException($"{CommandFormatting.FormatCommand(StartInfo)} failed: {details}", ExitCode == 0 ? 1 : ExitCode);
+    }
+}
 
 record CommandBytesResult(int ExitCode, byte[] StdOut, string StdErr);
